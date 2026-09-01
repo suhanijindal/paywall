@@ -114,6 +114,36 @@ Step 7 matters. We never mark an order paid because the browser said so — a br
 
 ---
 
+## Connecting an AI assistant
+
+An outside AI agent can discover this merchant at
+`GET /.well-known/agentic-commerce.json` — one document describing the catalog,
+the purchase endpoint, and the rule that the caller supplies a spending limit
+but never a price.
+
+For assistants that speak the **Model Context Protocol** (like Claude Desktop),
+this repo ships an MCP server over stdio with three tools: `search_products`,
+`get_product`, and `purchase`. Add this to your Claude Desktop config
+(`claude_desktop_config.json`), using the absolute path to this repo:
+
+```json
+{
+  "mcpServers": {
+    "paywall": {
+      "command": "python3",
+      "args": ["-m", "app.mcp_server"],
+      "cwd": "/absolute/path/to/paywall"
+    }
+  }
+}
+```
+
+Restart Claude Desktop and the three tools appear. The `purchase` tool has no
+price field by design — the assistant can pick a product and a spending limit,
+but the price is always read from the catalog on the merchant's side.
+
+---
+
 ## Status
 
 Day 1 of build. Working end to end: catalog → agent request → limit checks → Razorpay order → checkout → webhook confirmation → audit log.

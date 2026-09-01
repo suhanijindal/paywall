@@ -100,3 +100,31 @@ are all straightforward. Before submission the suite needs genuinely ambiguous
 cases - purchases that are arguably fine and arguably not - so the false-block
 number stops being zero. A system that never makes a mistake has not been
 tested hard enough.
+
+### Broke: MCP server crashed with "no such table: orders"
+
+Found by live testing against Claude Desktop, not by the test suite. With the
+database file missing, a `purchase` call through the MCP server died with a
+sqlite `no such table: orders` internal error. The tables only ever got created
+by the FastAPI app's startup hook (`store.init_db()`); the MCP server, reached
+directly through its JSON-RPC `dispatch()`, assumed they already existed.
+
+**Fix.** Call `store.init_db()` at the top of `dispatch()`, before any request
+is handled. It is a set of `CREATE TABLE IF NOT EXISTS` statements — cheap and
+safe to run on every call — so the server now stands up its own schema instead
+of depending on another process having run first. (`main_loop()` already called
+it, but no real caller — neither the tests nor the live stdio host — goes
+through `main_loop()`; they all enter via `dispatch()`, which is why that call
+never helped.)
+
+**Why the suite missed it.** Every test used the `fresh_db` fixture, which
+always calls `store.init_db()` on a `tmp_path` database before the test runs.
+So a clean, valid schema was *always* present — the one condition under which
+this bug cannot occur. The fixtures guaranteed away the exact state that breaks
+production.
+
+**Lesson.** Fixtures that always set up a clean, valid state cannot catch
+missing-setup bugs. At least one test must exercise the absence of setup — here,
+`test_purchase_recreates_a_missing_database` deletes the database file the
+fixture created, then asserts the purchase still succeeds. It fails without the
+fix and passes with it.

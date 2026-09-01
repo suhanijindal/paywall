@@ -47,6 +47,68 @@ def get_catalog():
 
 
 # ---------------------------------------------------------------------------
+# Discovery - the front door for an outside AI agent
+# ---------------------------------------------------------------------------
+
+@app.get("/.well-known/agentic-commerce.json")
+def agentic_commerce_manifest(request: Request):
+    """
+    The one document an outside AI agent reads to learn how to buy from us.
+
+    Track 1 asks us to make the merchant "sellable to AI buyers". This is how:
+    a well-known URL any agent (Claude Desktop, ChatGPT, a custom bot) can
+    fetch to discover the catalog, the purchase endpoint, and - most
+    importantly - the rules. An agent that reads this should be able to buy
+    with no other documentation.
+
+    The "constraints" block is the whole safety design stated in plain words
+    for a machine: you MUST tell us your spending limit, and you CANNOT tell us
+    a price. Prices come from the merchant. This is not a suggestion the agent
+    may ignore; the /agent/buy request shape has no price field to fill in.
+    """
+    base = str(request.base_url).rstrip("/")
+    return {
+        "schema_version": "0.1",
+        "merchant": {
+            "name": "Chai & Coffee Co.",
+            "description": "An Indian tea and coffee shop that sells to AI buyers.",
+        },
+        "catalog_url": base + "/catalog",
+        "purchase_endpoint": {
+            "url": base + "/agent/buy",
+            "method": "POST",
+            "content_type": "application/json",
+            "request_shape": {
+                "query": "string - what you want, in plain words (e.g. 'masala chai')",
+                "max_price_paise": "integer - REQUIRED - the most you may spend, in paise",
+                "quantity": "integer 1-10 - how many units",
+                "idempotency_key": "string - a unique id for this purchase attempt",
+            },
+            "returns": "The matched product, the price we looked up, a Razorpay "
+                       "order, and a checkout_url a human opens to approve payment.",
+        },
+        "constraints": {
+            "max_price_paise": {
+                "required": True,
+                "note": "You MUST supply this. It is your spending limit, applied "
+                        "to the order total. No limit means no purchase.",
+            },
+            "price": {
+                "accepted": False,
+                "note": "You CANNOT supply a price, amount, or total. Prices come "
+                        "from the merchant's catalog and are looked up on our side. "
+                        "The request shape above has no field for a price by design.",
+            },
+        },
+        "mcp": {
+            "note": "This merchant also ships a Model Context Protocol server "
+                    "(app/mcp_server.py) so an AI assistant can search and buy "
+                    "using tools instead of raw HTTP. See the README.",
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # The buying flow
 # ---------------------------------------------------------------------------
 
@@ -56,6 +118,97 @@ class BuyRequest(BaseModel):
     max_price_paise: int = Field(..., description="The most it is allowed to spend, in paise")
     quantity: int = Field(1, ge=1, le=10)
     idempotency_key: str = Field(..., description="Unique string for this purchase attempt")
+
+
+async def create_purchase(product, quantity, max_price_paise, idempotency_key):
+    """
+    The one and only place an order is created and the limit is enforced.
+
+    Both the HTTP endpoint (/agent/buy) and the MCP server (app/mcp_server.py)
+    call this. There is deliberately no second path: a purchase that skips
+    these checks cannot exist, because there is nowhere else that creates an
+    order. The caller resolves *which* product it wants; this function decides
+    whether the sale is allowed and, if so, prices and records it.
+
+    It never raises for a business refusal. Instead it returns a dict with an
+    "outcome" the caller translates into whatever its channel needs - an HTTP
+    status code for the API, plain English for an AI assistant. The outcomes:
+
+        over_limit  the total is more than the caller is allowed to spend
+        no_stock    fewer units exist than were asked for
+        created     the order was made; payment can now happen
+
+    Note what the caller does NOT get to pass: a price. The amount is computed
+    here from the catalog, every time. A compromised buyer can choose the wrong
+    product; it can never choose what that product costs.
+    """
+    amount = product["price_paise"] * quantity
+
+    # The limit applies to the total, not the unit price. Two kettles at the
+    # limit is still over the limit.
+    if amount > max_price_paise:
+        store.log_event("order.rejected", {
+            "reason": "total exceeds the spending limit",
+            "sku": product["sku"],
+            "total_paise": amount,
+            "limit_paise": max_price_paise,
+        })
+        return {"outcome": "over_limit", "sku": product["sku"],
+                "amount_paise": amount, "limit_paise": max_price_paise}
+
+    if product["stock"] < quantity:
+        store.log_event("order.rejected", {
+            "reason": "not enough stock",
+            "sku": product["sku"],
+        })
+        return {"outcome": "no_stock", "sku": product["sku"],
+                "stock": product["stock"], "quantity": quantity}
+
+    order_id = "ord_" + uuid.uuid4().hex[:12]
+    rzp = await payments.create_order(
+        amount_paise=amount,
+        receipt=order_id,
+        notes={"sku": product["sku"], "quantity": str(quantity)},
+    )
+
+    store.create_order(
+        order_id=order_id,
+        idempotency_key=idempotency_key,
+        sku=product["sku"],
+        quantity=quantity,
+        amount_paise=amount,
+        razorpay_order_id=rzp["id"],
+    )
+    store.log_event("order.created", {
+        "sku": product["sku"],
+        "name": product["name"],
+        "quantity": quantity,
+        "amount_paise": amount,
+        "limit_paise": max_price_paise,
+        "razorpay_order_id": rzp["id"],
+        "mock": rzp.get("_mock", False),
+    }, order_id=order_id)
+
+    # Revenue side: offer one add-on, but only if it still fits the limit.
+    suggestion = recommend.suggest(product["sku"], amount, max_price_paise)
+    if suggestion:
+        store.log_event("suggestion.offered", suggestion, order_id=order_id)
+    else:
+        store.log_event("suggestion.withheld", {
+            "reason": "no add-on fits inside the remaining spending limit",
+            "headroom_paise": max_price_paise - amount,
+        }, order_id=order_id)
+
+    return {
+        "outcome": "created",
+        "order_id": order_id,
+        "product": product,
+        "quantity": quantity,
+        "amount_paise": amount,
+        "razorpay_order_id": rzp["id"],
+        "checkout_url": f"/checkout/{order_id}",
+        "suggestion": suggestion,
+    }
 
 
 @app.post("/agent/buy")
@@ -92,70 +245,23 @@ async def agent_buy(req: BuyRequest):
         })
         raise HTTPException(404, "No product matches that request within the limit")
 
-    product = matches[0]
-    amount = product["price_paise"] * req.quantity
+    result = await create_purchase(
+        matches[0], req.quantity, req.max_price_paise, req.idempotency_key
+    )
 
-    # The limit applies to the total, not the unit price. Two kettles at the
-    # limit is still over the limit.
-    if amount > req.max_price_paise:
-        store.log_event("order.rejected", {
-            "reason": "total exceeds the spending limit",
-            "sku": product["sku"],
-            "total_paise": amount,
-            "limit_paise": req.max_price_paise,
-        })
+    if result["outcome"] == "over_limit":
         raise HTTPException(400, "Total exceeds the spending limit")
-
-    if product["stock"] < req.quantity:
-        store.log_event("order.rejected", {
-            "reason": "not enough stock",
-            "sku": product["sku"],
-        })
+    if result["outcome"] == "no_stock":
         raise HTTPException(409, "Not enough stock")
 
-    order_id = "ord_" + uuid.uuid4().hex[:12]
-    rzp = await payments.create_order(
-        amount_paise=amount,
-        receipt=order_id,
-        notes={"sku": product["sku"], "quantity": str(req.quantity)},
-    )
-
-    store.create_order(
-        order_id=order_id,
-        idempotency_key=req.idempotency_key,
-        sku=product["sku"],
-        quantity=req.quantity,
-        amount_paise=amount,
-        razorpay_order_id=rzp["id"],
-    )
-    store.log_event("order.created", {
-        "sku": product["sku"],
-        "name": product["name"],
-        "quantity": req.quantity,
-        "amount_paise": amount,
-        "limit_paise": req.max_price_paise,
-        "razorpay_order_id": rzp["id"],
-        "mock": rzp.get("_mock", False),
-    }, order_id=order_id)
-
-    # Revenue side: offer one add-on, but only if it still fits the limit.
-    suggestion = recommend.suggest(product["sku"], amount, req.max_price_paise)
-    if suggestion:
-        store.log_event("suggestion.offered", suggestion, order_id=order_id)
-    else:
-        store.log_event("suggestion.withheld", {
-            "reason": "no add-on fits inside the remaining spending limit",
-            "headroom_paise": req.max_price_paise - amount,
-        }, order_id=order_id)
-
     return {
-        "order_id": order_id,
-        "product": product,
-        "quantity": req.quantity,
-        "amount_paise": amount,
-        "razorpay_order_id": rzp["id"],
-        "checkout_url": f"/checkout/{order_id}",
-        "suggestion": suggestion,
+        "order_id": result["order_id"],
+        "product": result["product"],
+        "quantity": result["quantity"],
+        "amount_paise": result["amount_paise"],
+        "razorpay_order_id": result["razorpay_order_id"],
+        "checkout_url": result["checkout_url"],
+        "suggestion": result["suggestion"],
     }
 
 

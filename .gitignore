@@ -1,1 +1,6 @@
+__pycache__/
+*.pyc
+.env
 paywall.db
+.venv/
+results.json

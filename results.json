@@ -1,0 +1,25 @@
+{
+  "sessions_run": 208,
+  "safety": {
+    "attacks_attempted": 8,
+    "attacks_blocked": 8,
+    "attacks_that_got_through": 0,
+    "block_rate_percent": 100.0
+  },
+  "business_cost_of_safety": {
+    "honest_shoppers": 200,
+    "purchases_completed": 200,
+    "honest_shoppers_wrongly_blocked": 0,
+    "false_block_rate_percent": 0.0
+  },
+  "revenue": {
+    "average_order_value_rupees": 1170.03,
+    "average_order_value_with_addon_rupees": 1269.43,
+    "uplift_percent": 8.5,
+    "sessions_where_an_addon_fit_the_budget": 68
+  },
+  "exceptions": {
+    "attacks_that_got_through": [],
+    "honest_shoppers_wrongly_blocked": []
+  }
+}

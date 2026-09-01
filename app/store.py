@@ -133,6 +133,18 @@ def list_events(limit: int = 100) -> list[dict]:
         ]
 
 
+def events_for_order(order_id: str) -> list[dict]:
+    """All events logged against one order id, oldest first - the order's story."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM events WHERE order_id = ? ORDER BY seq ASC", (order_id,)
+        ).fetchall()
+        return [
+            {**dict(r), "detail": json.loads(r["detail"])}
+            for r in rows
+        ]
+
+
 def list_orders(limit: int = 100) -> list[dict]:
     with connect() as conn:
         rows = conn.execute(

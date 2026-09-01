@@ -15,7 +15,9 @@ Endpoints, in the order the story happens:
   GET  /ledger               the audit trail
 """
 
+import asyncio
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -23,17 +25,27 @@ from pydantic import BaseModel, Field
 
 from app import buyer_agent, catalog, payments, recommend, reconcile, store
 
-app = FastAPI(title="Paywall", version="0.1.0")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Startup and shutdown, expressed the way current FastAPI wants it.
 
-@app.on_event("startup")
-async def startup() -> None:
+    This replaces the deprecated @app.on_event("startup") hook; the behaviour
+    is identical. On startup: create the database tables, record that the
+    system started, and launch the background reconciliation loop that catches
+    any payment whose webhook never arrived. On shutdown we cancel that loop.
+    """
     store.init_db()
     store.log_event("system.started", {"mock_mode": payments.MOCK_MODE})
-    # The reconciliation loop runs in the background for the whole life of
-    # the process, catching any payment whose webhook never arrived.
-    import asyncio
-    asyncio.create_task(reconcile.run_forever())
+    reconcile_task = asyncio.create_task(reconcile.run_forever())
+    try:
+        yield
+    finally:
+        reconcile_task.cancel()
+
+
+app = FastAPI(title="Paywall", version="0.1.0", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -144,27 +156,38 @@ async def create_purchase(product, quantity, max_price_paise, idempotency_key):
     """
     amount = product["price_paise"] * quantity
 
+    # Give every purchase attempt an id up front - refused or not - so its whole
+    # story can be retold later by /explain. The id is attached to the events
+    # below even when no row is written to the orders table: a refused attempt
+    # never becomes an order, but it stays auditable.
+    order_id = "ord_" + uuid.uuid4().hex[:12]
+
     # The limit applies to the total, not the unit price. Two kettles at the
     # limit is still over the limit.
     if amount > max_price_paise:
         store.log_event("order.rejected", {
             "reason": "total exceeds the spending limit",
             "sku": product["sku"],
+            "name": product["name"],
+            "quantity": quantity,
             "total_paise": amount,
             "limit_paise": max_price_paise,
-        })
-        return {"outcome": "over_limit", "sku": product["sku"],
+        }, order_id=order_id)
+        return {"outcome": "over_limit", "order_id": order_id, "sku": product["sku"],
                 "amount_paise": amount, "limit_paise": max_price_paise}
 
     if product["stock"] < quantity:
         store.log_event("order.rejected", {
             "reason": "not enough stock",
             "sku": product["sku"],
-        })
-        return {"outcome": "no_stock", "sku": product["sku"],
+            "name": product["name"],
+            "quantity": quantity,
+            "stock": product["stock"],
+            "limit_paise": max_price_paise,
+        }, order_id=order_id)
+        return {"outcome": "no_stock", "order_id": order_id, "sku": product["sku"],
                 "stock": product["stock"], "quantity": quantity}
 
-    order_id = "ord_" + uuid.uuid4().hex[:12]
     rzp = await payments.create_order(
         amount_paise=amount,
         receipt=order_id,
@@ -238,21 +261,58 @@ async def agent_buy(req: BuyRequest):
 
     matches = catalog.search(req.query, max_price_paise=req.max_price_paise)
     if not matches:
+        # Nothing fits within the limit. A refusal is the case a merchant most
+        # wants justified - it is a lost sale - so we mint an order_id and
+        # record the refusal in the events table (never a row in orders: it was
+        # never an order). To explain WHY, we look again with no price ceiling:
+        # either the item exists but costs more than the limit, or there is no
+        # such product at all.
+        order_id = "ord_" + uuid.uuid4().hex[:12]
+        closest = catalog.search(req.query)
+        if closest:
+            product = closest[0]
+            amount = product["price_paise"] * req.quantity
+            store.log_event("order.rejected", {
+                "reason": "total exceeds the spending limit",
+                "sku": product["sku"],
+                "name": product["name"],
+                "query": req.query,
+                "quantity": req.quantity,
+                "total_paise": amount,
+                "limit_paise": req.max_price_paise,
+            }, order_id=order_id)
+            raise HTTPException(400, detail={
+                "error": "The closest matching product is over your spending limit",
+                "order_id": order_id,
+                "explain_url": f"/explain/{order_id}",
+            })
         store.log_event("order.rejected", {
-            "reason": "no product matched within the spending limit",
+            "reason": "no product matched the request",
             "query": req.query,
-            "max_price_paise": req.max_price_paise,
+            "limit_paise": req.max_price_paise,
+        }, order_id=order_id)
+        raise HTTPException(404, detail={
+            "error": "No product matches that request",
+            "order_id": order_id,
+            "explain_url": f"/explain/{order_id}",
         })
-        raise HTTPException(404, "No product matches that request within the limit")
 
     result = await create_purchase(
         matches[0], req.quantity, req.max_price_paise, req.idempotency_key
     )
 
     if result["outcome"] == "over_limit":
-        raise HTTPException(400, "Total exceeds the spending limit")
+        raise HTTPException(400, detail={
+            "error": "Total exceeds the spending limit",
+            "order_id": result["order_id"],
+            "explain_url": f"/explain/{result['order_id']}",
+        })
     if result["outcome"] == "no_stock":
-        raise HTTPException(409, "Not enough stock")
+        raise HTTPException(409, detail={
+            "error": "Not enough stock",
+            "order_id": result["order_id"],
+            "explain_url": f"/explain/{result['order_id']}",
+        })
 
     return {
         "order_id": result["order_id"],
@@ -392,6 +452,153 @@ def ledger():
     return {"events": store.list_events()}
 
 
+# ---------------------------------------------------------------------------
+# Explainability - turning the machine-readable audit trail into English
+# ---------------------------------------------------------------------------
+
+def _rupees(paise) -> str:
+    """Format a paise amount as a rupee string, dropping a trailing .00."""
+    try:
+        value = paise / 100
+    except TypeError:
+        return str(paise)
+    if value == int(value):
+        return "Rs {:,}".format(int(value))
+    return "Rs {:,.2f}".format(value)
+
+
+def build_order_narrative(order_id: str):
+    """
+    Retell everything that happened to one order in plain English, read purely
+    from the append-only events table. Returns the narrative string, or None if
+    the id is unknown so the endpoint can answer 404.
+
+    Every money action logs an event with a machine-readable reason code; this
+    is what turns that trail into a sentence a human can check. It handles a
+    refused attempt as well as a completed order.
+    """
+    events = store.events_for_order(order_id)
+    if not events and store.get_order(order_id) is None:
+        return None
+
+    by_kind = {}
+    for e in events:
+        by_kind.setdefault(e["kind"], []).append(e["detail"])
+
+    parts = ["Order {}.".format(order_id)]
+
+    if by_kind.get("order.created"):
+        d = by_kind["order.created"][0]
+        name = d.get("name", d.get("sku", "the item"))
+        qty = d.get("quantity", 1)
+        amount = d.get("amount_paise", 0)
+        limit = d.get("limit_paise")
+        asked = name if not qty or qty == 1 else "{} × {}".format(qty, name)
+
+        if limit is not None:
+            parts.append("An AI assistant requested {} with a spending limit of {}."
+                         .format(asked, _rupees(limit)))
+        else:
+            parts.append("An AI assistant requested {}.".format(asked))
+        parts.append("The system matched {} at {} from the merchant catalog — "
+                     "the assistant did not supply this price.".format(name, _rupees(amount)))
+        if limit is not None:
+            parts.append("{} is within the {} limit, so the order was created."
+                         .format(_rupees(amount), _rupees(limit)))
+        else:
+            parts.append("The order was created.")
+
+        if by_kind.get("suggestion.offered"):
+            sug = by_kind["suggestion.offered"][0]
+            remained = (limit - amount) if limit is not None else None
+            if remained is not None:
+                parts.append("A {} at {} was suggested because {} of the limit remained."
+                             .format(sug.get("name", "an add-on"),
+                                     _rupees(sug.get("price_paise", 0)), _rupees(remained)))
+            else:
+                parts.append("A {} at {} was suggested as an add-on."
+                             .format(sug.get("name", "an add-on"),
+                                     _rupees(sug.get("price_paise", 0))))
+        elif by_kind.get("suggestion.withheld"):
+            wh = by_kind["suggestion.withheld"][0]
+            parts.append("No add-on was suggested because only {} of the limit "
+                         "remained — not enough for one."
+                         .format(_rupees(wh.get("headroom_paise", 0))))
+
+        if by_kind.get("order.deduplicated"):
+            parts.append("A later identical request reusing the same idempotency key "
+                         "was recognised as a duplicate, so no second order was created.")
+
+        if by_kind.get("payment.captured"):
+            pay = by_kind["payment.captured"][0]
+            parts.append("Payment has been confirmed (payment id {})."
+                         .format(pay.get("payment_id", "unknown")))
+        else:
+            parts.append("Payment has not yet been confirmed.")
+
+    elif by_kind.get("order.rejected"):
+        d = by_kind["order.rejected"][-1]
+        reason = d.get("reason", "the request could not be fulfilled")
+        sku = d.get("sku")
+        name = d.get("name") or (catalog.BY_SKU.get(sku, {}).get("name") if sku else None)
+        query = d.get("query")
+        limit = d.get("limit_paise")
+        total = d.get("total_paise")
+        qty = d.get("quantity")
+        # What the shopper asked for: the raw query if we kept it, else the
+        # product name we resolved it to.
+        requested = query or name or "a product"
+
+        if limit is not None:
+            parts.append("An AI assistant requested {} with a spending limit of {}."
+                         .format(requested, _rupees(limit)))
+        else:
+            parts.append("An AI assistant requested {}.".format(requested))
+
+        if reason == "total exceeds the spending limit":
+            match = name or "the item"
+            if qty and qty != 1:
+                parts.append("The closest match was {} × {} at {} in total from "
+                             "the merchant catalog.".format(qty, match, _rupees(total)))
+            else:
+                parts.append("The closest match was {} at {} from the merchant "
+                             "catalog.".format(match, _rupees(total)))
+            parts.append("{} exceeds the {} limit, so no order was created and no "
+                         "payment was attempted.".format(_rupees(total), _rupees(limit)))
+        elif reason == "not enough stock":
+            have = d.get("stock")
+            tail = " (only {} in stock)".format(have) if have is not None else ""
+            parts.append("The merchant did not have enough stock to fulfil it{}, so "
+                         "no order was created and no payment was attempted.".format(tail))
+        elif reason == "no product matched the request":
+            parts.append("No product in the merchant catalog matched that request, "
+                         "so no order was created and no payment was attempted.")
+        else:
+            parts.append("The request was refused ({}), so no order was created and "
+                         "no payment was attempted.".format(reason))
+    else:
+        parts.append("The order was recorded, but no create or refuse event was "
+                     "found for it, so there is nothing further to explain.")
+
+    return " ".join(parts)
+
+
+@app.get("/explain/{order_id}")
+def explain_order(order_id: str):
+    """
+    A plain-English account of everything that happened to one order.
+
+    Track 1's bar is that every money action must be EXPLAINABLE. The events
+    table already records each decision as a machine-readable reason code; this
+    endpoint turns that trail into something a human can read and check. It
+    works for refused attempts as well as successful orders.
+    """
+    narrative = build_order_narrative(order_id)
+    if narrative is None:
+        raise HTTPException(404, "Unknown order")
+    return {"order_id": order_id, "narrative": narrative}
+
+
 @app.post("/admin/reconcile")
 async def manual_reconcile():
     """
@@ -436,8 +643,19 @@ async def agent_chat(req: ChatRequest):
 
     clean, error = buyer_agent.validate_proposal(proposal)
     if error:
-        store.log_event("agent.rejected", {"reason": error})
-        raise HTTPException(422, f"Could not act on that: {error}")
+        # Even a request we could not interpret is a refusal worth explaining,
+        # so it gets an order_id and an events-table entry (no orders row).
+        order_id = "ord_" + uuid.uuid4().hex[:12]
+        store.log_event("order.rejected", {
+            "reason": "could not interpret the request: " + error,
+            "query": req.message,
+            "limit_paise": req.max_price_paise,
+        }, order_id=order_id)
+        raise HTTPException(422, detail={
+            "error": f"Could not act on that: {error}",
+            "order_id": order_id,
+            "explain_url": f"/explain/{order_id}",
+        })
 
     if clean["model_tried_to_set_price"]:
         # Worth logging loudly. A model attempting to name a price is a strong

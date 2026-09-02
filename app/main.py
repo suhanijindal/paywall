@@ -500,8 +500,8 @@ def build_order_narrative(order_id: str):
                          .format(asked, _rupees(limit)))
         else:
             parts.append("An AI assistant requested {}.".format(asked))
-        parts.append("The system matched {} at {} from the merchant catalog — "
-                     "the assistant did not supply this price.".format(name, _rupees(amount)))
+        parts.append("The system matched {} at {} from the merchant catalog. "
+                     "The assistant did not supply this price.".format(name, _rupees(amount)))
         if limit is not None:
             parts.append("{} is within the {} limit, so the order was created."
                          .format(_rupees(amount), _rupees(limit)))
@@ -522,7 +522,7 @@ def build_order_narrative(order_id: str):
         elif by_kind.get("suggestion.withheld"):
             wh = by_kind["suggestion.withheld"][0]
             parts.append("No add-on was suggested because only {} of the limit "
-                         "remained — not enough for one."
+                         "remained, not enough for one."
                          .format(_rupees(wh.get("headroom_paise", 0))))
 
         if by_kind.get("order.deduplicated"):
